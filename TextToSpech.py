@@ -10,12 +10,20 @@ import tempfile
 
 from indextts.infer_v2 import IndexTTS2
 
+# ---------- token regexes ----------
 WAIT_RE = re.compile(
     r"<\s*wait\s+(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)?\s*>",
     flags=re.IGNORECASE
 )
 TARGET_RE = re.compile(
     r"<\s*(?:target|len|duration)\s+(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)?\s*>",
+    flags=re.IGNORECASE
+)
+# Unified tokenizer for wait + emo + emo-clear
+TOKEN_RE = re.compile(
+    r"(?P<wait><\s*wait\s+(?P<sec>\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)?\s*>)"
+    r"|(?P<emo><\s*emo(?::|\s+)(?P<emo_text>[^>]+)>)"
+    r"|(?P<clear><\s*emo[-_\s]*clear\s*>)",
     flags=re.IGNORECASE
 )
 
@@ -35,7 +43,6 @@ def _parse_vec(s):
         return None
 
 def _parse_target_times_arg(s):
-    """Parse --target_times '4,5,6.5' into list[float]."""
     if not s:
         return []
     parts = [p.strip() for p in str(s).split(",") if p.strip()]
@@ -121,21 +128,56 @@ def _extract_target_and_clean(text: str):
     clean = TARGET_RE.sub(repl, text)
     return clean.strip(), target
 
-def _split_text_by_wait_tags(text):
-    parts = []
+def _normalize_emo_text(raw: str) -> str:
+    # Collapse commas/whitespace to a single-space phrase
+    tokens = re.split(r"[\s,]+", (raw or "").strip())
+    tokens = [t for t in tokens if t]
+    return " ".join(tokens) if tokens else ""
+
+def _tokenize_with_emo_and_wait(text: str, initial_emo: str = None):
+    """
+    Return sequence preserving order:
+      ('text', segment_text, emo_text_or_None)
+      ('wait', seconds)
+    Emotion is a sticky state set by <emo ...> and cleared by <emo-clear>.
+    """
+    events = []
     last = 0
-    for m in WAIT_RE.finditer(text):
+    # raw events w/o emo applied
+    raw_events = []
+    for m in TOKEN_RE.finditer(text):
         if m.start() > last:
-            segment = text[last:m.start()].strip()
-            if segment:
-                parts.append(("text", segment))
-        secs = float(m.group(1))
-        parts.append(("wait", secs))
+            pre = text[last:m.start()].strip()
+            if pre:
+                raw_events.append(("text", pre))
+        if m.group("wait"):
+            secs = float(m.group("sec"))
+            raw_events.append(("wait", secs))
+        elif m.group("emo"):
+            emo_raw = _normalize_emo_text(m.group("emo_text"))
+            raw_events.append(("set_emo", emo_raw))
+        elif m.group("clear"):
+            raw_events.append(("clear_emo", None))
         last = m.end()
     tail = text[last:].strip()
     if tail:
-        parts.append(("text", tail))
-    return parts if parts else [("text", text.strip())]
+        raw_events.append(("text", tail))
+    if not raw_events:
+        # no tokens at all
+        return [("text", text.strip(), initial_emo)]
+
+    # second pass: apply sticky emo
+    current_emo = initial_emo
+    for kind, val in raw_events:
+        if kind == "text":
+            events.append(("text", val, current_emo))
+        elif kind == "wait":
+            events.append(("wait", val))
+        elif kind == "set_emo":
+            current_emo = val if val else None
+        elif kind == "clear_emo":
+            current_emo = None
+    return events
 
 def _concat_wavs_with_silences(chunks, out_path):
     """chunks: [('wav', path), ('silence', secs), ...]"""
@@ -165,13 +207,8 @@ def _wav_duration_seconds(path):
     return AudioSegment.from_file(path).duration_seconds
 
 def _ffmpeg_atempo_chain(factor):
-    """
-    Builds an ffmpeg atempo chain approximating |factor|.
-    atempo supports 0.5..2.0. We chain steps within that range.
-    """
     steps = []
     remaining = factor
-    # split into steps near 0.5..2
     while remaining < 0.5 or remaining > 2.0:
         if remaining < 1.0:
             steps.append(0.5)
@@ -180,26 +217,14 @@ def _ffmpeg_atempo_chain(factor):
             steps.append(2.0)
             remaining /= 2.0
     steps.append(remaining)
-    # merge near-1.0 steps
-    filt = ",".join(f"atempo={s:.6f}" for s in steps)
-    return filt
+    return ",".join(f"atempo={s:.6f}" for s in steps)
 
 def _stretch_wav(in_path, out_path, factor):
-    """
-    factor >1.0 => speed up (shorter); <1.0 => slow down (longer)
-    Uses ffmpeg atempo chain.
-    """
     ffmpeg_bin = shutil.which("ffmpeg") or shutil.which("ffmpeg.exe")
     if not ffmpeg_bin:
         raise RuntimeError("ffmpeg not found in PATH.")
     filt = _ffmpeg_atempo_chain(factor)
-    cmd = [
-        ffmpeg_bin, "-y", "-hide_banner",
-        "-loglevel", "error",
-        "-i", in_path,
-        "-filter:a", filt,
-        out_path
-    ]
+    cmd = [ffmpeg_bin, "-y", "-hide_banner", "-loglevel", "error", "-i", in_path, "-filter:a", filt, out_path]
     subprocess.run(cmd, check=True)
 
 def _infer_one_text_to_temp(tts: IndexTTS2, text: str, tmpdir: str, idx: int,
@@ -231,18 +256,18 @@ def _infer_one_text_to_temp(tts: IndexTTS2, text: str, tmpdir: str, idx: int,
 # -------------------- main --------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Batch Text->Speech using IndexTTS (wait tags + target duration)")
-    parser.add_argument("--input", "-i", required=True, help="Text file, one line per utterance (supports 'TEXT || EMO_TEXT' and <wait X sec>, <target X sec>)")
-    parser.add_argument("--spk_audio_prompt", "-p", required=True, help="Path to speaker prompt audio (voice.wav or .mp3)")
-    parser.add_argument("--output_path", "-o", required=True,
-                        help="Output dir or template. Dir => out/utt_<i>_<name>.wav. Template supports {i} and {name}.")
+    parser = argparse.ArgumentParser(description="Batch Text->Speech using IndexTTS (wait + emo tokens + target duration)")
+    parser.add_argument("--input", "-i", required=True, help="Text file, one line per utterance. Supports <wait>, <emo: ...>, <emo-clear>, <target ...>.")
+    parser.add_argument("--spk_audio_prompt", "-p", required=True, help="Path to speaker prompt audio (wav/mp3)")
+    parser.add_argument("--output_path", "-o", required=True, help="Output dir or template. Dir => out/utt_<i>_<name>.wav. Template supports {i} and {name}.")
     parser.add_argument("--emo_alpha", "-a", type=float, default=0.65)
     parser.add_argument("--emo_vector", "-v", default="")
     parser.add_argument("--emo_audio_prompt", help="Path to emotional reference audio (optional)")
-    parser.add_argument("--use_emo_text", action="store_true")
+    parser.add_argument("--use_emo_text", action="store_true", help="Enable text-driven emotion (used for global/per-line/tokens)")
     parser.add_argument("--use_random", action="store_true")
-    parser.add_argument("--emo_text", help="Global emotion text (overridden by per-line)")
-    parser.add_argument("--line_delim", default="||", help="Delimiter between EMO_TEXT and per-line TEXT")
+    parser.add_argument("--emo_text", help="Global default emotion text (used until overridden by <emo ...>)")
+    parser.add_argument("--enable_emo_tokens", action="store_true", help="Enable <emo ...> and <emo-clear> sticky tokens")
+    parser.add_argument("--line_delim", default="||", help="Backward-compat: 'TEXT || EMO' sets initial emotion for the line (tokens can still override later)")
     parser.add_argument("--enable_wait_tags", action="store_true", help="Enable <wait X sec> inside text")
     parser.add_argument("--target_times", help="Comma list of target seconds per line, e.g. '4,5,6.5'")
     parser.add_argument("--target_times_file", help="File with one target seconds per line")
@@ -268,7 +293,7 @@ if __name__ == "__main__":
     with open(args.input, "r", encoding="utf-8") as f:
         raw_lines = [ln.rstrip("\n") for ln in f.readlines()]
 
-    # parse lines (TEXT [|| EMO_TEXT]); also extract inline <target ...>
+    # parse lines: optional "TEXT || EMO" (for initial emo), also extract inline <target ...>
     lines = []
     inline_targets = []
     delim = args.line_delim
@@ -276,27 +301,25 @@ if __name__ == "__main__":
         line = raw.strip()
         if not line:
             continue
-        # first split TEXT || EMO_TEXT (correct order)
+        initial_emo = None
+        text_part = line
         if delim and delim in line:
-            emo_text_part ,text_part,  = [p.strip() for p in line.split(delim, 1)]
-        else:
-            emo_text_part ,text_part= line, None
-        # extract <target ...> from text part
+            # correct order: TEXT || EMO
+            text_part, initial_emo = [p.strip() for p in line.split(delim, 1)]
         clean_text, target_sec = _extract_target_and_clean(text_part)
-        lines.append((clean_text, emo_text_part))
+        lines.append((clean_text, initial_emo))
         inline_targets.append(target_sec)
 
     if not lines:
         print("No non-empty lines found in input.")
         sys.exit(1)
 
-    # external targets
+    # target durations
     targets_from_arg = _parse_target_times_arg(args.target_times) if args.target_times else []
     targets_from_file = _read_target_times_file(args.target_times_file) if args.target_times_file else []
-    # merge priority: inline tag > --target_times > file > None
     target_seconds = []
     for i in range(len(lines)):
-        t = inline_targets[i] if i < len(inline_targets) and inline_targets[i] is not None else None
+        t = inline_targets[i] if inline_targets[i] is not None else None
         if t is None and i < len(targets_from_arg) and targets_from_arg[i] is not None:
             t = targets_from_arg[i]
         if t is None and i < len(targets_from_file) and targets_from_file[i] is not None:
@@ -309,17 +332,13 @@ if __name__ == "__main__":
             emo_vec = emo_vec + [0.0] * (8 - len(emo_vec))
         emo_vec = [float(x) for x in emo_vec[:8]]
 
-    provided_globally = False
-    try:
-        provided_globally = bool(
-            (args.emo_audio_prompt and str(args.emo_audio_prompt).strip()) or
-            (args.emo_vector and str(args.emo_vector).strip()) or
-            args.use_emo_text or
-            (args.emo_text and str(args.emo_text).strip()) or
-            args.use_random
-        )
-    except Exception:
-        provided_globally = False
+    provided_globally = bool(
+        (args.emo_audio_prompt and str(args.emo_audio_prompt).strip()) or
+        (args.emo_vector and str(args.emo_vector).strip()) or
+        args.use_emo_text or
+        (args.emo_text and str(args.emo_text).strip()) or
+        args.use_random
+    )
 
     out_template = args.output_path
     if out_template.endswith(os.path.sep) or os.path.isdir(out_template):
@@ -336,89 +355,89 @@ if __name__ == "__main__":
             def make_out(i, name):
                 return f"{base}_{i}{ext or '.wav'}"
 
-    # -------------------- generation with timing control --------------------
-    for idx, (text, per_line_emo_text) in enumerate(lines, start=1):
+    # -------------------- generation with tokens + timing --------------------
+    for idx, (text, initial_emo_for_line) in enumerate(lines, start=1):
         name = _safe_filename(text) or f"line{idx}"
         out_path = make_out(idx, name)
 
-        provided_this_line = provided_globally or (per_line_emo_text is not None)
-        emo_text_to_pass = per_line_emo_text if per_line_emo_text else (args.emo_text if provided_globally and args.emo_text else None)
-        use_emo_text_val = (args.use_emo_text if provided_globally else False) or (emo_text_to_pass is not None)
+        provided_this_line = provided_globally or (initial_emo_for_line is not None)
+        emo_audio_prompt_to_pass = args.emo_audio_prompt if provided_this_line else None
+        emo_vec_to_pass = emo_vec if provided_this_line else None
+        emo_alpha_to_pass = args.emo_alpha if provided_this_line else 0.0
+        use_random_to_pass = args.use_random if provided_this_line else False
 
-        if provided_this_line:
-            emo_audio_prompt_to_pass = args.emo_audio_prompt if args.emo_audio_prompt else None
-            emo_vec_to_pass = emo_vec
-            emo_alpha_to_pass = args.emo_alpha
-            use_random_to_pass = args.use_random
-        else:
-            emo_audio_prompt_to_pass = None
-            emo_vec_to_pass = None
-            emo_alpha_to_pass = 0.0
-            use_random_to_pass = False
-
+        # seed emotion: per-line initial or global
+        seed_emo = initial_emo_for_line if initial_emo_for_line else (args.emo_text if args.emo_text else None)
         tgt = target_seconds[idx-1] if idx-1 < len(target_seconds) else None
 
         try:
             tmpdir = tempfile.mkdtemp(prefix=f"tts_line_{idx:03d}_")
             chunks = []       # [('wav', path) or ('silence', secs)]
-            voiced_wavs = []  # keep only wav paths for duration calc
-            waits = []        # list of floats (secs) for waits in order
+            voiced_wavs = []  # wav paths
+            waits = []        # float seconds
 
-            if args.enable_wait_tags and WAIT_RE.search(text):
-                print(f"[{idx}/{len(lines)}] Generating with <wait> tags -> {out_path} (target={tgt}s, emo_text={emo_text_to_pass})")
-                seq = _split_text_by_wait_tags(text)
+            # Token path (preferred when enabled) — supports <emo>, <emo-clear>, <wait>
+            if (args.enable_emo_tokens or args.enable_wait_tags) and TOKEN_RE.search(text):
+                print(f"[{idx}/{len(lines)}] Generating with tokens -> {out_path} (target={tgt}s)")
+                seq = _tokenize_with_emo_and_wait(text, initial_emo=seed_emo)
 
                 seg_counter = 0
-                for kind, val in seq:
-                    if kind == "text" and val.strip():
+                for item in seq:
+                    if item[0] == "text" and item[1].strip():
                         seg_counter += 1
+                        seg_text = item[1]
+                        seg_emo  = item[2]
+
+                        # decide emotion flags for this segment
+                        seg_use_emo_text = args.use_emo_text and (seg_emo is not None or seed_emo is not None)
+                        seg_emo_text_to_pass = seg_emo if seg_emo is not None else (seed_emo if seg_use_emo_text else None)
+
                         tmp_wav = _infer_one_text_to_temp(
-                            tts, val, tmpdir, seg_counter,
+                            tts, seg_text, tmpdir, seg_counter,
                             spk_audio_prompt=args.spk_audio_prompt,
                             emo_audio_prompt=emo_audio_prompt_to_pass,
                             emo_alpha=emo_alpha_to_pass,
                             emo_vector=emo_vec_to_pass,
-                            use_emo_text=use_emo_text_val,
-                            emo_text=emo_text_to_pass,
+                            use_emo_text=seg_use_emo_text,
+                            emo_text=seg_emo_text_to_pass,
                             use_random=use_random_to_pass,
                             verbose=args.verbose
                         )
                         chunks.append(("wav", tmp_wav))
                         voiced_wavs.append(tmp_wav)
-                    elif kind == "wait":
-                        waits.append(float(val))
-                        chunks.append(("silence", float(val)))
+
+                    elif item[0] == "wait":
+                        waits.append(float(item[1]))
+                        chunks.append(("silence", float(item[1])))
+
             else:
-                print(f"[{idx}/{len(lines)}] Generating -> {out_path} (target={tgt}s, emo_text={emo_text_to_pass})")
-                # one voiced chunk only
+                # No tokens path: single segment (still honors global/per-line initial emo)
+                print(f"[{idx}/{len(lines)}] Generating -> {out_path} (target={tgt}s)")
+                seg_use_emo_text = args.use_emo_text and (seed_emo is not None)
+                seg_emo_text_to_pass = seed_emo if seg_use_emo_text else None
+
                 tmp_wav = _infer_one_text_to_temp(
                     tts, text, tmpdir, 1,
                     spk_audio_prompt=args.spk_audio_prompt,
                     emo_audio_prompt=emo_audio_prompt_to_pass,
                     emo_alpha=emo_alpha_to_pass,
                     emo_vector=emo_vec_to_pass,
-                    use_emo_text=use_emo_text_val,
-                    emo_text=emo_text_to_pass,
+                    use_emo_text=seg_use_emo_text,
+                    emo_text=seg_emo_text_to_pass,
                     use_random=use_random_to_pass,
                     verbose=args.verbose
                 )
                 chunks.append(("wav", tmp_wav))
                 voiced_wavs.append(tmp_wav)
 
-            # --- timing control ---
+            # --- target duration fitting (same policy as before) ---
             if tgt is not None:
-                from pydub import AudioSegment  # for durations
-
                 voiced_dur = sum(_wav_duration_seconds(p) for p in voiced_wavs)
                 waits_dur = sum(waits) if waits else 0.0
                 total = voiced_dur + waits_dur
 
-                # utility to rebuild chunks with updated waits and (optionally) stretched voiced files
                 def rebuild_and_export(stretched_voiced_paths, new_waits, path_out):
-                    rebuilt = []
-                    v_idx = 0
-                    w_idx = 0
-                    # walk original chunks order, replacing with new assets
+                    rebuilt, v_idx, w_idx = [], 0, 0
                     for kind, val in chunks:
                         if kind == "wav":
                             rebuilt.append(("wav", stretched_voiced_paths[v_idx]))
@@ -428,60 +447,48 @@ if __name__ == "__main__":
                             w_idx += 1
                     _concat_wavs_with_silences(rebuilt, path_out)
 
-                # Case A: total > target → reduce waits first, then speed up voice if needed
                 if total > tgt:
                     need_reduce = total - tgt
-                    new_waits = list(waits)  # copy
+                    new_waits = list(waits)
                     if waits_dur > 0:
-                        # proportional reduction of waits
                         reduce_from_waits = min(need_reduce, waits_dur)
                         scale = (waits_dur - reduce_from_waits) / waits_dur
                         new_waits = [w * scale for w in waits]
                         waits_after = sum(new_waits)
                         remain_delta = total - (voiced_dur + waits_after)
                     else:
-                        waits_after = 0.0
-                        new_waits = []
                         remain_delta = need_reduce
+                        new_waits = []
 
-                    # if still too long, speed up voiced by factor f > 1
                     if remain_delta > 1e-3 and voiced_dur > 0:
-                        desired_voiced = voiced_dur - remain_delta
-                        desired_voiced = max(desired_voiced, 0.05)  # floor
-                        speed_factor = voiced_dur / desired_voiced  # >1
+                        desired_voiced = max(voiced_dur - remain_delta, 0.05)
+                        speed_factor = voiced_dur / desired_voiced  # > 1.0
                         stretched = []
                         for i, vp in enumerate(voiced_wavs, 1):
-                            outp = os.path.join(tmpdir, f"seg_stretch_{i:04d}.wav")
+                            outp = os.path.join(tmpdir, f"seg_speed_{i:04d}.wav")
                             _stretch_wav(vp, outp, speed_factor)
                             stretched.append(outp)
                         rebuild_and_export(stretched, new_waits, out_path)
                     else:
-                        # waits reduction sufficed
                         rebuild_and_export(voiced_wavs, new_waits, out_path)
 
-                # Case B: total < target → increase waits if present; else slow voice
                 elif total < tgt - 1e-3:
                     need_increase = tgt - total
                     if waits_dur > 0:
-                        # proportional increase of waits
                         new_waits = [w + (w / waits_dur) * need_increase for w in waits]
                         rebuild_and_export(voiced_wavs, new_waits, out_path)
                     else:
-                        # slow down voiced
                         desired_voiced = voiced_dur + need_increase
-                        slow_factor = voiced_dur / desired_voiced  # <1
+                        slow_factor = voiced_dur / desired_voiced  # < 1.0
                         slowed = []
                         for i, vp in enumerate(voiced_wavs, 1):
-                            outp = os.path.join(tmpdir, f"seg_stretch_{i:04d}.wav")
+                            outp = os.path.join(tmpdir, f"seg_slow_{i:04d}.wav")
                             _stretch_wav(vp, outp, slow_factor)
                             slowed.append(outp)
-                        # still no waits → use zeros
                         rebuild_and_export(slowed, [], out_path)
                 else:
-                    # already within ~1ms
                     _concat_wavs_with_silences(chunks, out_path)
             else:
-                # no target: normal concat
                 _concat_wavs_with_silences(chunks, out_path)
 
         except Exception as e:

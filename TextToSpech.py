@@ -116,7 +116,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_emo_text", action="store_true", help="Use text-to-emotion mode (convert text to emotion vectors)")
     parser.add_argument("--use_random", action="store_true", help="Use emo random flag")
     parser.add_argument("--emo_text", help="Explicit emotion text to use for ALL lines (overridden by per-line emo_text if present)")
-    parser.add_argument("--line_delim", default="||", help="Delimiter between text and per-line emo_text in input (default '||')")
+    parser.add_argument("--line_delim", default=",", help="Delimiter between text and per-line emo_text in input (default ',')")
     parser.add_argument("--verbose", action="store_true", help="Verbose infer")
     parser.add_argument("--config", default="checkpoints/config.yaml", help="Path to config.yaml")
     parser.add_argument("--model_dir", default="checkpoints", help="Model directory")
@@ -151,8 +151,8 @@ if __name__ == "__main__":
             continue
         if delim and delim in line:
             parts = line.split(delim, 1)
-            text_part = parts[0].strip()
-            emo_text_part = parts[1].strip()
+            text_part = parts[1].strip()
+            emo_text_part = parts[0].strip()
             lines.append((text_part, emo_text_part))
         else:
             lines.append((line, None))

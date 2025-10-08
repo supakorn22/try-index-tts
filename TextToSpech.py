@@ -11,10 +11,6 @@ import tempfile
 from indextts.infer_v2 import IndexTTS2
 
 # ---------- token regexes ----------
-WAIT_RE = re.compile(
-    r"<\s*wait\s+(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)?\s*>",
-    flags=re.IGNORECASE
-)
 TARGET_RE = re.compile(
     r"<\s*(?:target|len|duration)\s+(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)?\s*>",
     flags=re.IGNORECASE
@@ -355,7 +351,7 @@ if __name__ == "__main__":
             def make_out(i, name):
                 return f"{base}_{i}{ext or '.wav'}"
 
-    # -------------------- generation with tokens + timing --------------------
+    # -------------------- generation with tokens + timing --------------------'
     for idx, (text, initial_emo_for_line) in enumerate(lines, start=1):
         name = _safe_filename(text) or f"line{idx}"
         out_path = make_out(idx, name)
@@ -380,7 +376,6 @@ if __name__ == "__main__":
             if (args.enable_emo_tokens or args.enable_wait_tags) and TOKEN_RE.search(text):
                 print(f"[{idx}/{len(lines)}] Generating with tokens -> {out_path} (target={tgt}s)")
                 seq = _tokenize_with_emo_and_wait(text, initial_emo=seed_emo)
-
                 seg_counter = 0
                 for item in seq:
                     if item[0] == "text" and item[1].strip():
@@ -446,7 +441,8 @@ if __name__ == "__main__":
                             rebuilt.append(("silence", float(new_waits[w_idx])))
                             w_idx += 1
                     _concat_wavs_with_silences(rebuilt, path_out)
-
+                print(f"  durations: voiced={voiced_dur:.3f}s + waits={waits_dur:.3f}s = total={total:.3f}s")
+                print(f"  target: {tgt:.3f}s")
                 if total > tgt:
                     need_reduce = total - tgt
                     new_waits = list(waits)
@@ -455,11 +451,11 @@ if __name__ == "__main__":
                         scale = (waits_dur - reduce_from_waits) / waits_dur
                         new_waits = [w * scale for w in waits]
                         waits_after = sum(new_waits)
-                        remain_delta = total - (voiced_dur + waits_after)
+                        remain_delta = tgt - (voiced_dur + waits_after)
                     else:
                         remain_delta = need_reduce
                         new_waits = []
-
+                    print(f"  after waits adjust: new_waits={new_waits}, remain_delta={remain_delta:.3f}s")
                     if remain_delta > 1e-3 and voiced_dur > 0:
                         desired_voiced = max(voiced_dur - remain_delta, 0.05)
                         speed_factor = voiced_dur / desired_voiced  # > 1.0
